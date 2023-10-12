@@ -4,12 +4,12 @@ use anchor_lang::solana_program::system_instruction;
 
 declare_id!("5GQn3NDZgciJmNB85Az5V5FrAY64QddUWW9kKsRDLn2a");
 
-const PREFIX_STATE: &str= "state_8";
-const PREFIX_CONFIG: &str = "config_8";
-const PREFIX_BALANCE: &str = "balance_8";
-const PREFIX_ORDER: &str = "order_8";
-const PREFIX_RECEIPT: &str = "receipt_8";
-const PREFIX_CCFEE: &str = "ccfee_8";
+const PREFIX_STATE: &str= "state";
+const PREFIX_CONFIG: &str = "config";
+const PREFIX_BALANCE: &str = "balance";
+const PREFIX_ORDER: &str = "order";
+const PREFIX_RECEIPT: &str = "receipt";
+const PREFIX_CCFEE: &str = "ccfee";
 const ADMIN: &str = "BuTuA7YKzx5CUn3bALZcK97jQrFM94QfsBUaUdM6BCxm";
 
 #[program]
