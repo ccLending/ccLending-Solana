@@ -62,7 +62,7 @@ pub mod solana_lending {
 
     pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
         let user_balance = &mut ctx.accounts.user_balance;
-        require!(user_balance.amount >= amount, MyError::InsufficientBalanceForWithdraw);
+        require!(user_balance.amount >= amount, MyError::InsufficientUserBalance);
         user_balance.amount -= amount;
         **ctx.accounts.user_balance.to_account_info().try_borrow_mut_lamports()? -= amount;
         **ctx.accounts.payer.to_account_info().try_borrow_mut_lamports()? += amount;
@@ -75,7 +75,7 @@ pub mod solana_lending {
         let global = &mut ctx.accounts.global;
         let config = &ctx.accounts.config;
     
-        require!(user_balance.amount >= amount, MyError::InsufficientBalanceForPlaceOrder);
+        require!(user_balance.amount >= amount, MyError::InsufficientUserBalance);
         require!(rate >= config.min_ir && rate <= config.max_ir, MyError::IllegalInterestRate);
         order.sn = global.curr_order_sn;
         order.lender = ctx.accounts.payer.key();
@@ -99,11 +99,11 @@ pub mod solana_lending {
     pub fn cancel_order(ctx: Context<CancelOrder>, order_sn: u64) -> Result<()> {
         let order = &ctx.accounts.order;
         let user_balance = &mut ctx.accounts.user_balance;
-        require!(order_sn == order.sn && order.lender == ctx.accounts.payer.key(), MyError::NoOrderFoundForCancelOrder);
+        require!(order.lender == *ctx.accounts.payer.key, MyError::NoOrderFound);
         user_balance.amount += order.balance;
         
         emit!(EventCancelOrder {
-            order_sn: order.sn,
+            order_sn: order_sn,
             lender: ctx.accounts.payer.key(),
             balance: order.balance,
         });
@@ -113,14 +113,23 @@ pub mod solana_lending {
         Ok(())
     }
 
+    pub fn close_order(ctx: Context<CloseOrder>, order_sn: u64) -> Result<()> {
+        let order = &ctx.accounts.order;
+        require!(order.balance == 0, MyError::NonZeroOrderBalance);
+        emit!(EventCloseOrder {
+            order_sn: order_sn,
+            lender: order.lender,
+        });
+        Ok(())
+    }
+
     #[access_control(only_admin(&ctx.accounts.payer))]
     pub fn borrow(ctx: Context<Borrow>, order_sn: u64, borrower: Pubkey, amount: u64, chainid: u32, c_sn: u64, source: [u8; 20], token: [u8; 20], frozen: u64) -> Result<()> {
         let receipt = &mut ctx.accounts.receipt;
         let order = &mut ctx.accounts.order;
         let global = &mut ctx.accounts.global;
-        require!(order.balance >= amount, MyError::InsufficientOrderBalanceForBorrow);
-        require!(order.sn == order_sn, MyError::InvalidOrderSNForBorrow);
-
+        require!(order.balance >= amount, MyError::InsufficientOrderBalance);
+        
         receipt.sn = global.curr_receipt_sn;
         receipt.borrower = borrower;
         receipt.lender = order.lender;
@@ -159,9 +168,9 @@ pub mod solana_lending {
     pub fn repay(ctx: Context<Repay>, receipt_sn: u64) -> Result<()> {
         let receipt = &mut ctx.accounts.receipt;
         let config = &ctx.accounts.config;
-        let cc_fee = &ctx.accounts.cc_fee;
-        require!(receipt.borrower == *ctx.accounts.payer.key, MyError::NoReceiptFoundForRepay);
-        require!(receipt.sn == receipt_sn, MyError::NoReceiptFoundForRepay);
+        let ccfee = &ctx.accounts.cc_fee;
+        let lender_balance = &mut ctx.accounts.lender_balance;
+        require!(receipt.borrower == *ctx.accounts.payer.key, MyError::NoReceiptFound);
         
         let mut amount = receipt.amount + (receipt.amount * receipt.rate as u64) / 10000;
         let now = ctx.accounts.clock.unix_timestamp as u64;
@@ -173,18 +182,19 @@ pub mod solana_lending {
             amount += (receipt.amount * config.penalty_ir) / 1000 * overdue_days;
         }
         let commission = (amount - receipt.amount) * config.commission_rate / 100;
-
+        lender_balance.amount += amount - commission;
+        
         invoke(
-            &system_instruction::transfer(ctx.accounts.payer.key, ctx.accounts.lender_balance.to_account_info().key, amount + cc_fee.fee),
+            &system_instruction::transfer(ctx.accounts.payer.key, ctx.accounts.lender_balance.to_account_info().key, amount + ccfee.fee),
             &[
                 ctx.accounts.payer.to_account_info(),
                 ctx.accounts.lender_balance.to_account_info(),
                 ctx.accounts.system_program.to_account_info(),
             ],
         )?;
-        **ctx.accounts.lender_balance.to_account_info().try_borrow_mut_lamports()? -= commission + cc_fee.fee;
-        **ctx.accounts.admin.try_borrow_mut_lamports()? += commission + cc_fee.fee;
-
+        **ctx.accounts.lender_balance.to_account_info().try_borrow_mut_lamports()? -= commission + ccfee.fee;
+        **ctx.accounts.admin.try_borrow_mut_lamports()? += commission + ccfee.fee;
+        
         emit!(EventRepaySuccess {
             receipt_sn: receipt_sn,
             borrower: receipt.borrower,
@@ -200,10 +210,38 @@ pub mod solana_lending {
         Ok(())
     }
 
+    pub fn liquidate(ctx: Context<Liquidate>, receipt_sn: u64, receiver: [u8; 20]) -> Result<()> {
+        let receipt = &mut ctx.accounts.receipt;
+        let config = &ctx.accounts.config;
+        let ccfee = &ctx.accounts.cc_fee;   
+        require!(receipt.lender == *ctx.accounts.payer.key, MyError::NoReceiptFound);
+        require!(ctx.accounts.clock.unix_timestamp as u64 > receipt.time + config.deadline, MyError::DeadlineNotMeet);
+
+        invoke(
+            &system_instruction::transfer(ctx.accounts.payer.key, ctx.accounts.admin.to_account_info().key, ccfee.fee),
+            &[
+                ctx.accounts.payer.to_account_info(),
+                ctx.accounts.admin.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
+        emit!(EventLiquidate {
+            receipt_sn: receipt_sn,
+            borrower: receipt.borrower,
+            lender: receipt.lender,
+            chainid: receipt.chainid,
+            c_sn: receipt.c_sn,
+            source: receipt.source,
+            frozen: receipt.frozen,
+            receiver: receiver,
+        });
+        Ok(())
+    }
+
     #[access_control(only_admin(&ctx.accounts.payer))]
     pub fn set_ccfee(ctx: Context<SetCCFee>, _chainid: u32, fee: u64) -> Result<()> {
-        let cc_fee = &mut ctx.accounts.cc_fee;
-        cc_fee.fee = fee;
+        let ccfee = &mut ctx.accounts.cc_fee;
+        ccfee.fee = fee;
         Ok(())
     }
 }
@@ -254,6 +292,19 @@ pub struct CancelOrder<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(order_sn: u64)]
+pub struct CloseOrder<'info> {
+    #[account(mut, close = lender, seeds = [PREFIX_ORDER.as_bytes(), order_sn.to_le_bytes().as_ref()], bump)]
+    pub order: Account<'info, Order>,
+    /// CHECK:
+    #[account(mut, constraint = *lender.key == order.lender)]
+    pub lender: AccountInfo<'info>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 #[instruction(order_sn: u64, borrower: Pubkey)]
 pub struct Borrow<'info> {
     #[account(init, payer = payer, space = 8 + 156, seeds = [PREFIX_RECEIPT.as_bytes(), global.curr_receipt_sn.to_le_bytes().as_ref()], bump)]
@@ -263,7 +314,7 @@ pub struct Borrow<'info> {
     #[account(mut, seeds = [PREFIX_STATE.as_bytes()], bump)]
     pub global: Account<'info, GlobalState>,
     /// CHECK: 
-    #[account(mut, constraint = recipient.key == &borrower)]
+    #[account(mut, constraint = *recipient.key == borrower)]
     pub recipient: AccountInfo<'info>,
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -274,10 +325,28 @@ pub struct Borrow<'info> {
 #[derive(Accounts)]
 #[instruction(receipt_sn: u64)]
 pub struct Repay<'info> {
-    #[account(mut, close = payer, seeds = [PREFIX_RECEIPT.as_bytes(), receipt_sn.to_le_bytes().as_ref()], bump)]
+    #[account(mut, close = admin, seeds = [PREFIX_RECEIPT.as_bytes(), receipt_sn.to_le_bytes().as_ref()], bump)]
     pub receipt: Account<'info, LoanReceipt>,
     #[account(mut)]
     pub lender_balance: Account<'info, UserBalance>,
+    #[account(seeds = [PREFIX_CONFIG.as_bytes()], bump)]
+    pub config: Account<'info, Config>,
+    /// CHECK:
+    #[account(mut, constraint = admin.key.to_string() == ADMIN)]
+    pub admin: AccountInfo<'info>,
+    #[account(seeds = [PREFIX_CCFEE.as_bytes(), receipt.chainid.to_le_bytes().as_ref()], bump)]
+    pub cc_fee: Account<'info, CCFee>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    pub clock: Sysvar<'info, Clock>,
+}
+
+#[derive(Accounts)]
+#[instruction(receipt_sn: u64)]
+pub struct Liquidate<'info> {
+    #[account(mut, close = admin, seeds = [PREFIX_RECEIPT.as_bytes(), receipt_sn.to_le_bytes().as_ref()], bump)]
+    pub receipt: Account<'info, LoanReceipt>,
     #[account(seeds = [PREFIX_CONFIG.as_bytes()], bump)]
     pub config: Account<'info, Config>,
     /// CHECK:
@@ -391,6 +460,12 @@ pub struct EventCancelOrder {
 }
 
 #[event]
+pub struct EventCloseOrder {
+    pub order_sn: u64,
+    pub lender: Pubkey,
+}
+
+#[event]
 pub struct EventBorrowSuccess {
     pub receipt_sn: u64,
     pub borrower: Pubkey,
@@ -420,7 +495,19 @@ pub struct EventRepaySuccess {
     pub token: [u8; 20],
     pub frozen: u64,
 }
-    
+
+#[event]
+pub struct EventLiquidate {
+    pub receipt_sn: u64,
+    pub borrower: Pubkey,
+    pub lender: Pubkey,
+    pub chainid: u32,
+    pub c_sn: u64,
+    pub source: [u8; 20],
+    pub frozen: u64,
+    pub receiver: [u8; 20],
+}
+
 pub fn only_admin<'info>(payer: &Signer<'info>) -> Result<()> {
     if payer.key.to_string() != ADMIN {
         return Err(MyError::NoOperationPermission.into());
@@ -430,20 +517,20 @@ pub fn only_admin<'info>(payer: &Signer<'info>) -> Result<()> {
 
 #[error_code]
 pub enum MyError {
-    #[msg("Insufficient Balance for Place Order")]
-    InsufficientBalanceForPlaceOrder,
-    #[msg("Insufficient Balance for Withdraw")]
-    InsufficientBalanceForWithdraw,
-    #[msg("Illegal Interest Rate")]
+    #[msg("insufficient user balance")]
+    InsufficientUserBalance,
+    #[msg("illegal interest rate")]
     IllegalInterestRate,
-    #[msg("No Order Found for Cancel Order")]
-    NoOrderFoundForCancelOrder,
-    #[msg("Invalid Order for Borrow")]
-    InvalidOrderSNForBorrow,
-    #[msg("Insufficient Order Balance for Borrow")]
-    InsufficientOrderBalanceForBorrow,
-    #[msg("No Operation Permission")]
+    #[msg("no order found")]
+    NoOrderFound,
+    #[msg("non-zero order balance")]
+    NonZeroOrderBalance,
+    #[msg("insufficient order balance")]
+    InsufficientOrderBalance,
+    #[msg("no operation permission")]
     NoOperationPermission,
-    #[msg("No Receipt Found for Repay")]
-    NoReceiptFoundForRepay,
+    #[msg("no receipt found")]
+    NoReceiptFound,
+    #[msg("deadline not meet")]
+    DeadlineNotMeet,
 }
